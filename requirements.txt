@@ -1,0 +1,7 @@
+aiohttp>=3.9.0
+pycryptodome>=3.10.0
+requests>=2.25.0
+urllib3>=1.26.0
+ping3>=4.0.0
+ntplib>=0.4.0
+uvloop>=0.18.0
