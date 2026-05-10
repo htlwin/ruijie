@@ -111,20 +111,39 @@ def run(ping_threads=5, ping_interval=0.1, access_code="123456"):
             portal_host = f"{parsed.scheme}://{parsed.netloc}"
             log.info(f"[*] Portal: {portal_url}")
 
-            # 2. Get portal page
+            # 2. Get portal page and follow redirects to find real login page
             r1 = sess.get(portal_url, verify=False, timeout=10)
             html = r1.text
+            current_url = str(r1.url)
+            parsed = urlparse(current_url)
 
-            # 3. Follow JS redirect if present
-            m = re.search(r"location\.href\s*=\s*['\"]([^'\"]+)['\"]", html)
-            if m:
-                next_url = urljoin(portal_url, m.group(1))
-                log.info(f"[*] Following redirect: {next_url}")
-                r2 = sess.get(next_url, verify=False, timeout=10)
-                html = r2.text
-                parsed = urlparse(r2.url)
+            # Follow meta refresh (<meta http-equiv="refresh" content="0;url=...">)
+            for _ in range(5):
+                m = re.search(
+                    r'<meta[^>]+http-equiv=["\']?refresh["\']?[^>]+content=["\']?\d+;?\s*url=([^"\' >]+)',
+                    html, re.I
+                )
+                if m:
+                    next_url = urljoin(current_url, m.group(1))
+                    log.info(f"[*] Meta refresh -> {next_url}")
+                    r1 = sess.get(next_url, verify=False, timeout=10)
+                    html = r1.text
+                    current_url = str(r1.url)
+                    parsed = urlparse(current_url)
+                    continue
+                # Follow JS redirect
+                m = re.search(r"location\.href\s*=\s*['\"]([^'\"]+)['\"]", html)
+                if m:
+                    next_url = urljoin(current_url, m.group(1))
+                    log.info(f"[*] JS redirect -> {next_url}")
+                    r1 = sess.get(next_url, verify=False, timeout=10)
+                    html = r1.text
+                    current_url = str(r1.url)
+                    parsed = urlparse(current_url)
+                    continue
+                break
 
-            # 4. Try to get SID from URL or HTML
+            # 3. Try to get SID from URL or HTML
             sid = parse_qs(parsed.query).get("sessionId", [None])[0]
             if not sid:
                 sid = find_sid_in_html(html)
