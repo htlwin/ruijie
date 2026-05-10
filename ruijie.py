@@ -29,6 +29,14 @@ log = logging.getLogger("ruijie")
 CONFIG_DIR = Path.home() / ".config" / "ruijie"
 CONFIG_FILE = CONFIG_DIR / "config.json"
 PORTAL_BASE = "https://portal-as.ruijienetworks.com"
+PORTAL_FALLBACKS = [
+    "https://cloud-as.ruijienetworks.com",
+    "https://portal-as.ruijienetworks.com",
+    "http://172.16.0.1",
+    "http://10.10.10.1",
+    "http://192.168.1.1",
+    "http://192.168.0.1",
+]
 
 BANNER = r"""
   _____  _    _ _____       _ _____ ______
@@ -325,7 +333,16 @@ async def ensure_portal(session: aiohttp.ClientSession, config: Config):
     ps = await fetch_portal(session, config.portal_domain)
     if ps.auth_url or ps.session_id:
         return ps
-    log.info("[*] Default portal not found, auto-detecting...")
+    log.info("[*] Default portal not found, trying fallback domains...")
+    for domain in PORTAL_FALLBACKS:
+        if domain == config.portal_domain:
+            continue
+        ps = await fetch_portal(session, domain)
+        if ps.auth_url or ps.session_id:
+            log.info(f"[*] Found portal: {domain}")
+            config.portal_domain = domain
+            return ps
+    log.info("[*] No fallback worked, trying auto-detect via redirect...")
     detected_url = await detect_portal(session)
     if detected_url:
         from yarl import URL
