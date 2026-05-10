@@ -211,6 +211,39 @@ def random_voucher(length: int = 6) -> str:
     return "".join(random.choices(string.digits, k=length))
 
 
+async def detect_portal(session: aiohttp.ClientSession) -> str:
+    """Try to auto-detect the captive portal URL by following redirects."""
+    probe_urls = [
+        "http://connectivitycheck.gstatic.com",
+        "http://captive.apple.com",
+        "http://google.com",
+    ]
+    portal_keywords = ["login", "portal", "auth", "wifidog", "ruijie", "authenticate",
+                       "captive", "redirect", "connect", "signin", "userauth"]
+    for url in probe_urls:
+        try:
+            r = await session.get(url, allow_redirects=True, timeout=aiohttp.ClientTimeout(total=10))
+            final = str(r.url)
+            # Check if redirected to a different domain
+            if url.rstrip("/") in final.rstrip("/") or final.rstrip("/") == url.rstrip("/"):
+                continue
+            # Check URL for portal keywords
+            if any(k in final.lower() for k in portal_keywords):
+                log.info(f"[*] Portal detected: {final}")
+                return final
+            # Check page content for portal keywords
+            try:
+                text = (await r.text()).lower()[:3000]
+                if any(k in text for k in portal_keywords):
+                    log.info(f"[*] Portal detected (by content): {final}")
+                    return final
+            except Exception:
+                pass
+        except (aiohttp.ClientError, asyncio.TimeoutError):
+            continue
+    return ""
+
+
 async def try_bypass(session: aiohttp.ClientSession, config: Config, max_attempts: int = 200) -> bool:
     log.info("=" * 50)
     log.info("BYPASS MODE: Trying to get online without a voucher")
@@ -287,20 +320,48 @@ async def try_bypass(session: aiohttp.ClientSession, config: Config, max_attempt
     return False
 
 
+async def ensure_portal(session: aiohttp.ClientSession, config: Config):
+    """Auto-detect portal if current domain doesn't respond."""
+    ps = await fetch_portal(session, config.portal_domain)
+    if ps.auth_url or ps.session_id:
+        return ps
+    log.info("[*] Default portal not found, auto-detecting...")
+    detected_url = await detect_portal(session)
+    if detected_url:
+        from yarl import URL
+        u = URL(detected_url)
+        base = f"{u.scheme}://{u.host}"
+        if u.port and u.port not in (80, 443):
+            base += f":{u.port}"
+        log.info(f"[*] Setting portal domain to: {base}")
+        config.portal_domain = base
+        ps2 = await fetch_portal(session, base)
+        if ps2.auth_url or ps2.session_id:
+            return ps2
+    log.warning("[-] Could not detect portal. Run: ./ruijie status")
+    log.warning("    Then check your browser URL and set it with: ./ruijie set-domain <url>")
+    return ps
+
+
 async def cmd_bypass(max_attempts: int, config: Config):
     headers = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"}
     async with aiohttp.ClientSession(headers=headers) as session:
+        ps = await ensure_portal(session, config)
+        if not ps.auth_url:
+            log.error("[-] No portal found. Check your browser URL and use: ./ruijie set-domain <url>")
+            return
         ok = await try_bypass(session, config, max_attempts)
         if ok:
             log.info("[+] Bypass successful! You should have internet access.")
         else:
-            log.info("[-] Bypass failed. Try a real voucher with: ./ruijie login <code>")
+            log.info("[-] Bypass failed.")
 
 
 async def cmd_bypass_monitor(interval: int, max_attempts: int, config: Config):
     headers = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"}
     async with aiohttp.ClientSession(headers=headers) as session:
         log.info(f"Bypass monitor every {interval}s (Ctrl+C to stop)")
+        await ensure_portal(session, config)
         if not await check_internet(session):
             log.info("[*] Offline, starting bypass...")
             await try_bypass(session, config, max_attempts)
@@ -320,7 +381,10 @@ async def cmd_login(voucher: str, config: Config):
     headers = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"}
     async with aiohttp.ClientSession(headers=headers) as session:
         log.info(f"Fetching portal: {config.portal_domain}")
-        ps = await fetch_portal(session, config.portal_domain)
+        ps = await ensure_portal(session, config)
+        if not ps.auth_url:
+            log.error("[-] No portal found. Check your browser URL and use: ./ruijie set-domain <url>")
+            return
         log.info(f"Session: {ps.session_id or 'N/A'}")
         log.info(f"CHAP id={ps.chap_id or 'N/A'} challenge={(ps.chap_challenge or '')[:16]}...")
         if voucher:
@@ -333,6 +397,7 @@ async def cmd_monitor(interval: int, config: Config):
     headers = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"}
     async with aiohttp.ClientSession(headers=headers) as session:
         log.info(f"Monitoring every {interval}s (Ctrl+C to stop)")
+        await ensure_portal(session, config)
         try:
             while True:
                 online = await check_internet(session)
@@ -351,7 +416,7 @@ async def cmd_status(config: Config):
     async with aiohttp.ClientSession(headers=headers) as session:
         online = await check_internet(session)
         log.info(f"Internet: {'ONLINE' if online else 'OFFLINE'}")
-        ps = await fetch_portal(session, config.portal_domain)
+        ps = await ensure_portal(session, config)
         log.info(f"Session: {ps.session_id or 'N/A'}")
 
         try:
@@ -375,7 +440,7 @@ async def cmd_status(config: Config):
 async def cmd_logout(config: Config):
     headers = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"}
     async with aiohttp.ClientSession(headers=headers) as session:
-        ps = await fetch_portal(session, config.portal_domain)
+        ps = await ensure_portal(session, config)
         url = ps.logout_url or f"{config.portal_domain}/logout"
         try:
             r = await session.get(url, timeout=aiohttp.ClientTimeout(total=10))
