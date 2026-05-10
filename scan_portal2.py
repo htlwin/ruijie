@@ -40,9 +40,9 @@ except Exception as e:
 # Step 2: Parse URL params
 parsed = urllib.parse.urlparse(portal_url)
 params = urllib.parse.parse_qs(parsed.query)
-gw_addr = params.get("gw_address", [b"192.168.10.1".decode()])[0]
-gw_port = params.get("gw_port", [b"2060".decode()])[0]
-mac = params.get("mac", [b""].decode())[0]
+gw_addr = params.get("gw_address", ["192.168.10.1"])[0]
+gw_port = params.get("gw_port", ["2060"])[0]
+mac = params.get("mac", [""])[0]
 
 # Step 3: Properly parse CHAP challenge bytes
 log("\n[2] CHAP CHALLENGE PARSING...")
