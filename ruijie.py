@@ -150,7 +150,7 @@ def main():
         sys.exit(0)
 
     signal.signal(signal.SIGINT, sigint)
-    run(threads=args.threads, interval=args.interval, code=args.code)
+    run(ping_threads=args.threads, ping_interval=args.interval, access_code=args.code)
 
 
 if __name__ == "__main__":
