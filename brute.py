@@ -269,6 +269,11 @@ def numeric_bruteforce(length):
                     if target and len(bt.found) >= target:
                         STOP.set()
                         break
+                else:
+                    with LOCK:
+                        if success_count == 0 and errors == 0:
+                            msg = j.get("message", "?")
+                            print(f"\n  [API sample] code={code} | message={msg}")
                 with LOCK: success_count += 1
             except Exception as e:
                 with LOCK:
