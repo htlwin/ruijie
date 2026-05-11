@@ -147,22 +147,40 @@ def main():
         code_queue.put(c)
 
     # Detect captive portal
-    if check_online():
+    sess = requests.Session()
+    sess.verify = False
+    sess.headers["User-Agent"] = "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36"
+
+    # First check: generate_204 without redirects to get portal URL
+    r = sess.get("http://connectivitycheck.gstatic.com/generate_204", timeout=10, allow_redirects=False)
+    if r.status_code == 204:
         print("[!] Already online - must be on captive portal network")
         return
 
-    sess = requests.Session()
-    sess.verify = False
-    r = sess.get("http://connectivitycheck.gstatic.com/generate_204", timeout=10, allow_redirects=True)
-    parsed = urllib.parse.urlparse(r.url)
+    # Get portal redirect URL from Location header
+    portal_url = r.headers.get("Location", "")
+    if not portal_url:
+        # Try with redirects
+        r = sess.get("http://connectivitycheck.gstatic.com/generate_204", timeout=10, allow_redirects=True)
+        portal_url = r.url
+
+    print(f"[Debug] Portal URL: {portal_url[:100]}...")
+
+    parsed = urllib.parse.urlparse(portal_url)
     params = parsed.query
     host = f"{parsed.scheme}://{parsed.netloc}"
     qp = urllib.parse.parse_qs(params)
 
-    r = sess.get(f"{host}/api/auth/wifidog?stage=portal&{params}", timeout=10)
-    sid = urllib.parse.parse_qs(urllib.parse.urlparse(r.url).query).get("sessionId", [""])[0]
+    # If portal URL already has sessionId, use it directly
+    sid = qp.get("sessionId", [""])[0]
+    if not sid:
+        # Otherwise get sessionId from wifidog API
+        r = sess.get(f"{host}/api/auth/wifidog?stage=portal&{params}", timeout=10)
+        sid = urllib.parse.parse_qs(urllib.parse.urlparse(r.url).query).get("sessionId", [""])[0]
+
     if not sid:
         print("[!] No sessionId from portal")
+        print(f"[Debug] Final URL: {r.url}")
         return
 
     gw_addr = qp.get("gw_address", ["192.168.10.1"])[0]
