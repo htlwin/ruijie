@@ -157,7 +157,6 @@ def main():
                 r3 = requests.get("http://connectivitycheck.gstatic.com/generate_204", timeout=5, allow_redirects=False)
                 if r3.status_code == 204:
                     print("*** ONLINE ***")
-                    # Start keepalive
                     def ka():
                         while True:
                             sess.post(f"http://{gw_addr}:{gw_port}/wifidog/auth",
@@ -167,8 +166,11 @@ def main():
                             time.sleep(0.1)
                     threading.Thread(target=ka, daemon=True).start()
                     print("Keepalive running. Ctrl+C to stop.")
-                    try: while True: time.sleep(10)
-                    except KeyboardInterrupt: print("\nDone")
+                    try:
+                        while True:
+                            time.sleep(10)
+                    except KeyboardInterrupt:
+                        print("\nDone")
             except: pass
         else:
             print(f"Failed: {j.get('message', '?')}")
