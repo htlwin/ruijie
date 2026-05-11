@@ -71,7 +71,7 @@ def detect_portal():
         r = sess.get(f"{host}/api/auth/wifidog?stage=portal&{params}", timeout=10)
         sid = urllib.parse.parse_qs(urllib.parse.urlparse(r.url).query).get("sessionId", [""])[0]
     if not sid: return None, None, None, None, "No sessionId"
-    gw_addr = qp.get("gw_address", ["192.168.10.1"])[0]
+    gw_addr = qp.get("gw_address", ["192.168.110.1"])[0]
     gw_port = qp.get("gw_port", ["2060"])[0]
     return sess, host, params, sid, (gw_addr, gw_port)
 

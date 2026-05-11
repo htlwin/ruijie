@@ -49,7 +49,7 @@ def main():
             parsed = urllib.parse.urlparse(portal_url)
             params = urllib.parse.parse_qs(parsed.query)
             host = f"{parsed.scheme}://{parsed.netloc}"
-            gw_addr = params.get("gw_address", ["192.168.10.1"])[0]
+            gw_addr = params.get("gw_address", ["192.168.110.1"])[0]
             gw_port = params.get("gw_port", ["2060"])[0]
 
             r = sess.get(f"{host}/api/auth/wifidog?stage=portal&{parsed.query}", timeout=10)
